@@ -1,0 +1,4 @@
+[Validator] MT5 terminal siap
+INFO:     127.0.0.1:59442 - "POST /validate HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62610 - "POST /validate HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58332 - "POST /validate HTTP/1.1" 401 Unauthorized

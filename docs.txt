@@ -1,0 +1,12 @@
+Cara pakai di server Windows nanti:
+
+     cd C:\bot-validator
+     pip install -r requirements.txt
+     $env:MT5_PATH="C:\Program Files\MetaTrader 5\terminal64.exe"
+     $env:VALIDATOR_SECRET="rahasia123"
+     python app.py
+
+     Bot jalan di http://localhost:8002, Laravel tinggal set .env:
+
+     JOURNAL_VALIDATOR_URL=http://IP_SERVER_WINDOWS:8002
+     JOURNAL_VALIDATOR_SECRET=rahasia123
