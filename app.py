@@ -186,24 +186,38 @@ class _ApiClient:
             log.warning(f"sync_sltp_cache: {e}")
 
     def upload_report(self, account_id: int, html_path: str) -> dict:
+        import gzip
+        gz_path = html_path + ".gz"
+        with open(html_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+            f_out.write(f_in.read())
+        orig_kb = os.path.getsize(html_path) // 1024
+        gz_kb   = os.path.getsize(gz_path) // 1024
+        log.info(f"Report compressed: {orig_kb}KB → {gz_kb}KB")
+
         last_exc = None
-        for attempt in range(1, 3):
+        try:
+            for attempt in range(1, 3):
+                try:
+                    with open(gz_path, "rb") as f:
+                        r = self._s.post(
+                            f"{self._base}/journal/upload-report",
+                            params=self._p(),
+                            data={"account_id": account_id},
+                            files={"report_file": (os.path.basename(html_path) + ".gz", f, "application/gzip")},
+                            timeout=300,
+                        )
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as e:
+                    last_exc = e
+                    log.warning(f"upload_report attempt {attempt}/2: {e}")
+                    if attempt < 2:
+                        time.sleep(10)
+        finally:
             try:
-                with open(html_path, "rb") as f:
-                    r = self._s.post(
-                        f"{self._base}/journal/upload-report",
-                        params=self._p(),
-                        data={"account_id": account_id},
-                        files={"report_file": (os.path.basename(html_path), f, "text/html")},
-                        timeout=300,
-                    )
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                last_exc = e
-                log.warning(f"upload_report attempt {attempt}/2: {e}")
-                if attempt < 2:
-                    time.sleep(10)
+                os.remove(gz_path)
+            except Exception:
+                pass
         raise last_exc
 
     def report_auth_error(self, account_id, login, server,
