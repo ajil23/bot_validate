@@ -367,7 +367,7 @@ def _parse_sltp_comment(comment: str):
     return sl, tp
 
 
-def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: dict) -> str:
+def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: dict, pos_order_map: dict) -> str:
     name     = getattr(account_info, "name",     "N/A")
     login    = getattr(account_info, "login",    0)
     company  = getattr(account_info, "company",  "N/A")
@@ -380,7 +380,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
     running = peak = max_dd = 0.0
 
     # ── Deals rows ───────────────────────────────────────────
-    deal_rows = ""
+    deal_rows_parts = []
     for idx, d in enumerate(deals):
         d_time  = datetime.fromtimestamp(d.time).strftime("%Y.%m.%d %H:%M:%S")
         d_type  = {0:"buy",1:"sell",2:"balance",3:"credit",4:"charge",5:"correction",
@@ -419,7 +419,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             display_order = d.position_id
 
         bg = "#FFFFFF" if idx % 2 == 0 else "#F7F7F7"
-        deal_rows += (
+        deal_rows_parts.append(
             f'<tr bgcolor="{bg}" align="right">'
             f'<td>{d_time}</td><td>{d.ticket}</td><td>{d.symbol}</td>'
             f'<td>{d_type}</td><td>{d_entry}</td><td>{d.volume:.2f}</td>'
@@ -429,6 +429,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             f'<td>{running:.2f}</td><td colspan="2">{comment}</td>'
             f'</tr>'
         )
+    deal_rows = "".join(deal_rows_parts)
 
     # ── Positions ────────────────────────────────────────────
     pos_map: dict = {}
@@ -451,7 +452,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             pos_map[pid]["swap"]          += d.swap
             pos_map[pid]["close_comment"]  = d.comment or ""
 
-    position_rows = ""
+    position_rows_parts = []
     total_trades  = 0
     for ri, (pid, p) in enumerate(pos_map.items()):
         if p["open"] is None or p["close"] is None:
@@ -472,16 +473,11 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
                 if sl == 0: sl = ord_obj.sl or 0.0
                 if tp == 0: tp = ord_obj.tp or 0.0
 
-        # Metode 3: history_orders_get per position (requires active MT5 connection)
+        # Metode 3: lookup dari pos_order_map (data sudah di-fetch sebelumnya, tanpa MT5 call tambahan)
         if sl == 0 or tp == 0:
-            try:
-                pos_orders = mt5.history_orders_get(position=pid)
-                if pos_orders:
-                    for ord in pos_orders:
-                        if sl == 0 and (ord.sl or 0) > 0: sl = float(ord.sl)
-                        if tp == 0 and (ord.tp or 0) > 0: tp = float(ord.tp)
-            except Exception:
-                pass
+            for ord in pos_order_map.get(pid, []):
+                if sl == 0 and (ord.sl or 0) > 0: sl = float(ord.sl)
+                if tp == 0 and (ord.tp or 0) > 0: tp = float(ord.tp)
 
         # Metode 4: parse dari comment field
         c_sl, c_tp = _parse_sltp_comment(p.get("close_comment", ""))
@@ -492,7 +488,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
         if tp == 0 and o_tp > 0: tp = o_tp
 
         bg = "#FFFFFF" if ri % 2 == 0 else "#F7F7F7"
-        position_rows += (
+        position_rows_parts.append(
             f'<tr bgcolor="{bg}" align="right">'
             f'<td>{datetime.fromtimestamp(o.time).strftime("%Y.%m.%d %H:%M:%S")}</td>'
             f'<td>{pid}</td><td>{p["symbol"]}</td><td>{p["type"]}</td>'
@@ -504,12 +500,13 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             f'<td>{p["swap"]:.2f}</td><td colspan="2">{p["profit"]:.2f}</td>'
             f'</tr>'
         )
+    position_rows = "".join(position_rows_parts)
 
     # ── Orders ───────────────────────────────────────────────
     type_map  = {0:"buy",1:"sell",2:"buy limit",3:"sell limit",4:"buy stop",
                  5:"sell stop",6:"buy stop limit",7:"sell stop limit"}
     state_map = {1:"filled",2:"canceled",3:"partial"}
-    order_rows = ""
+    order_rows_parts = []
     for i, ord_obj in enumerate(sorted(order_map.values(), key=lambda x: x.time_setup)):
         try:
             bg     = "#FFFFFF" if i % 2 == 0 else "#F7F7F7"
@@ -520,7 +517,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             vol    = f"{ord_obj.volume_initial:.2f}/{ord_obj.volume_current:.2f}"
             sl_s   = f"{ord_obj.sl:.3f}" if ord_obj.sl and ord_obj.sl > 0 else ""
             tp_s   = f"{ord_obj.tp:.3f}" if ord_obj.tp and ord_obj.tp > 0 else ""
-            order_rows += (
+            order_rows_parts.append(
                 f'<tr bgcolor="{bg}" align="right">'
                 f'<td>{o_time}</td><td>{ord_obj.ticket}</td><td>{ord_obj.symbol}</td>'
                 f'<td>{type_map.get(ord_obj.type, str(ord_obj.type))}</td>'
@@ -531,6 +528,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             )
         except Exception:
             pass
+    order_rows = "".join(order_rows_parts)
 
     pct = lambda n: f"{(n / total_trades * 100) if total_trades else 0:.2f}%"
     return f"""<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
@@ -665,17 +663,20 @@ def _run_journal_for(acc: dict) -> tuple:
 
                     # Build order map untuk fallback SL/TP
                     order_map: dict = {}
+                    pos_order_map: dict = {}
                     try:
                         all_orders = mt5.history_orders_get(datetime(2020, 1, 1), datetime.now())
                         if all_orders:
                             order_map = {o.ticket: o for o in all_orders}
+                            for o in all_orders:
+                                if o.position_id:
+                                    pos_order_map.setdefault(o.position_id, []).append(o)
                         log.info(f"Order history: {len(order_map)} orders")
                     except Exception as e:
                         log.warning(f"history_orders_get failed: {e}")
 
-                    # Build HTML (masih dalam lock karena _build_html_report
-                    # memanggil mt5.history_orders_get(position=pid))
-                    html = _build_html_report(info, deals, sltp, order_map)
+                    # Build HTML (di luar MT5 call — pos_order_map sudah berisi semua data)
+                    html = _build_html_report(info, deals, sltp, order_map, pos_order_map)
                     tmp_dir  = tempfile.mkdtemp(prefix="journal_")
                     filepath = os.path.join(tmp_dir, f"report_{login}_{int(time.time())}.html")
                     with open(filepath, "w", encoding="utf-8") as f:
