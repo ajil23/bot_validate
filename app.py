@@ -22,7 +22,6 @@ import json
 import ssl
 import random
 import re
-import tempfile
 import traceback
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -185,39 +184,25 @@ class _ApiClient:
         except Exception as e:
             log.warning(f"sync_sltp_cache: {e}")
 
-    def upload_report(self, account_id: int, html_path: str) -> dict:
-        import gzip
-        gz_path = html_path + ".gz"
-        with open(html_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
-            f_out.write(f_in.read())
-        orig_kb = os.path.getsize(html_path) // 1024
-        gz_kb   = os.path.getsize(gz_path) // 1024
-        log.info(f"Report compressed: {orig_kb}KB → {gz_kb}KB")
-
+    def upload_report(self, account_id: int, report_data: dict) -> dict:
+        kb = len(json.dumps(report_data).encode()) // 1024
+        log.info(f"Report JSON: {kb}KB")
         last_exc = None
-        try:
-            for attempt in range(1, 3):
-                try:
-                    with open(gz_path, "rb") as f:
-                        r = self._s.post(
-                            f"{self._base}/journal/upload-report",
-                            params=self._p(),
-                            data={"account_id": account_id},
-                            files={"report_file": (os.path.basename(html_path) + ".gz", f, "application/gzip")},
-                            timeout=300,
-                        )
-                    r.raise_for_status()
-                    return r.json()
-                except Exception as e:
-                    last_exc = e
-                    log.warning(f"upload_report attempt {attempt}/2: {e}")
-                    if attempt < 2:
-                        time.sleep(10)
-        finally:
+        for attempt in range(1, 3):
             try:
-                os.remove(gz_path)
-            except Exception:
-                pass
+                r = self._s.post(
+                    f"{self._base}/journal/upload-report",
+                    params=self._p(),
+                    json={"account_id": account_id, "report_data": report_data},
+                    timeout=300,
+                )
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                last_exc = e
+                log.warning(f"upload_report attempt {attempt}/2: {e}")
+                if attempt < 2:
+                    time.sleep(10)
         raise last_exc
 
     def report_auth_error(self, account_id, login, server,
@@ -365,7 +350,7 @@ def _validate_sync(login: int, password: str, server: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# HTML REPORT BUILDER  (identik dengan format export manual MT5)
+# REPORT DATA BUILDER  (output JSON — sama struktur dgn Mt5ReportParser::parse())
 # Harus dipanggil saat MT5 masih terkoneksi (masih dalam _mt5_lock)
 # ══════════════════════════════════════════════════════════════
 
@@ -381,71 +366,48 @@ def _parse_sltp_comment(comment: str):
     return sl, tp
 
 
-def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: dict, pos_order_map: dict) -> str:
-    name     = getattr(account_info, "name",     "N/A")
-    login    = getattr(account_info, "login",    0)
-    company  = getattr(account_info, "company",  "N/A")
-    currency = getattr(account_info, "currency", "USD") or "USD"
-    balance  = getattr(account_info, "balance",  0.0)
-    equity   = getattr(account_info, "equity",   0.0)
+def _build_report_data(account_info, deals: list, sltp_cache: dict, order_map: dict, pos_order_map: dict) -> dict:
+    type_map  = {0:"buy",1:"sell",2:"balance",3:"credit",4:"charge",5:"correction",6:"bonus"}
+    entry_map = {0:"in",1:"out",2:"inout",3:"out_by"}
 
-    total_profit = total_deposit = total_withdraw = 0.0
-    won = lost = 0
-    running = peak = max_dd = 0.0
+    name     = getattr(account_info, "name",     "") or ""
+    company  = getattr(account_info, "company",  "") or ""
+    currency = (getattr(account_info, "currency", "USD") or "USD").upper().strip()
+    balance  = float(getattr(account_info, "balance", 0) or 0)
+    equity   = float(getattr(account_info, "equity",  0) or 0)
 
-    # ── Deals rows ───────────────────────────────────────────
-    deal_rows_parts = []
-    for idx, d in enumerate(deals):
-        d_time  = datetime.fromtimestamp(d.time).strftime("%Y.%m.%d %H:%M:%S")
-        d_type  = {0:"buy",1:"sell",2:"balance",3:"credit",4:"charge",5:"correction",
-                   6:"bonus"}.get(d.type, "?")
-        d_entry = {0:"in",1:"out",2:"inout",3:"out_by"}.get(d.entry, "")
-
+    # ── Deals ────────────────────────────────────────────────
+    running = total_deposit = 0.0
+    deals_out = []
+    for d in deals:
+        d_type  = type_map.get(d.type, "?")
+        d_entry = entry_map.get(d.entry, "")
         if d.type == 2:
             running += d.profit
-            if d.profit > 0: total_deposit  += d.profit
-            else:            total_withdraw += abs(d.profit)
+            if d.profit > 0: total_deposit += d.profit
         else:
             running += d.profit + d.commission + d.swap + getattr(d, "fee", 0)
-
-        if d.entry in (1, 2):
-            net = d.profit + d.commission + d.swap
-            total_profit += net
-            if net > 0:   won  += 1
-            elif net < 0: lost += 1
-
-        peak   = max(peak, running)
-        if peak > 0:
-            max_dd = max(max_dd, (peak - running) / peak * 100)
-
-        comment = d.comment or ""
-        if d.order:
-            ord_obj = order_map.get(d.order)
-            if ord_obj:
-                parts = []
-                if ord_obj.sl and ord_obj.sl > 0: parts.append(f"[sl {ord_obj.sl:.5f}]")
-                if ord_obj.tp and ord_obj.tp > 0: parts.append(f"[tp {ord_obj.tp:.5f}]")
-                if parts:
-                    comment = (comment + " " + " ".join(parts)).strip()
-
         display_order = d.order
         if d.entry in (1, 2) and d.order == 0 and d.position_id:
             display_order = d.position_id
+        deals_out.append({
+            "time":       datetime.fromtimestamp(d.time).strftime("%Y.%m.%d %H:%M:%S"),
+            "deal":       int(d.ticket),
+            "symbol":     d.symbol or "",
+            "type":       d_type,
+            "direction":  d_entry,
+            "volume":     round(float(d.volume), 2),
+            "price":      round(float(d.price), 5),
+            "order":      int(display_order),
+            "commission": round(float(d.commission), 2),
+            "fee":        round(float(getattr(d, "fee", 0)), 2),
+            "swap":       round(float(d.swap), 2),
+            "profit":     round(float(d.profit), 2),
+            "balance":    round(running, 2),
+            "comment":    d.comment or "",
+        })
 
-        bg = "#FFFFFF" if idx % 2 == 0 else "#F7F7F7"
-        deal_rows_parts.append(
-            f'<tr bgcolor="{bg}" align="right">'
-            f'<td>{d_time}</td><td>{d.ticket}</td><td>{d.symbol}</td>'
-            f'<td>{d_type}</td><td>{d_entry}</td><td>{d.volume:.2f}</td>'
-            f'<td>{d.price:.5f}</td><td>{display_order}</td><td></td>'
-            f'<td>{d.commission:.2f}</td><td>{getattr(d,"fee",0):.2f}</td>'
-            f'<td>{d.swap:.2f}</td><td>{d.profit:.2f}</td>'
-            f'<td>{running:.2f}</td><td colspan="2">{comment}</td>'
-            f'</tr>'
-        )
-    deal_rows = "".join(deal_rows_parts)
-
-    # ── Positions ────────────────────────────────────────────
+    # ── Positions (closed) ───────────────────────────────────
     pos_map: dict = {}
     for d in deals:
         if not d.position_id:
@@ -453,7 +415,7 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
         pid = d.position_id
         if pid not in pos_map:
             pos_map[pid] = {"open": None, "close": None, "profit": 0.0,
-                            "commission": 0.0, "swap": 0.0, "symbol": d.symbol,
+                            "commission": 0.0, "swap": 0.0, "symbol": d.symbol or "",
                             "type": "", "open_order": 0,
                             "open_comment": "", "close_comment": ""}
         if d.entry == 0:
@@ -466,34 +428,38 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
             pos_map[pid]["swap"]          += d.swap
             pos_map[pid]["close_comment"]  = d.comment or ""
 
-    position_rows_parts = []
-    total_trades  = 0
-    for ri, (pid, p) in enumerate(pos_map.items()):
+    positions_out = []
+    total_profit = 0.0
+    won = lost = 0
+    running2 = peak = max_dd = 0.0
+    for d in deals:
+        if d.type == 2: running2 += d.profit
+        else:           running2 += d.profit + d.commission + d.swap + getattr(d, "fee", 0)
+        peak = max(peak, running2)
+        if peak > 0: max_dd = max(max_dd, (peak - running2) / peak * 100)
+
+    for pid, p in pos_map.items():
         if p["open"] is None or p["close"] is None:
             continue
-        total_trades += 1
         o, c = p["open"], p["close"]
-        sl = tp = 0.0
+        net = p["profit"] + p["commission"] + p["swap"]
+        total_profit += net
+        if net > 0:   won  += 1
+        elif net < 0: lost += 1
 
-        # Metode 1: DB/local SL/TP cache
+        sl = tp = 0.0
         cached = sltp_cache.get(str(pid))
         if cached:
             sl, tp = cached.get("sl", 0.0), cached.get("tp", 0.0)
-
-        # Metode 2: opening order history
         if sl == 0 or tp == 0:
             ord_obj = order_map.get(p["open_order"])
             if ord_obj:
-                if sl == 0: sl = ord_obj.sl or 0.0
-                if tp == 0: tp = ord_obj.tp or 0.0
-
-        # Metode 3: lookup dari pos_order_map (data sudah di-fetch sebelumnya, tanpa MT5 call tambahan)
+                if sl == 0: sl = float(ord_obj.sl or 0)
+                if tp == 0: tp = float(ord_obj.tp or 0)
         if sl == 0 or tp == 0:
             for ord in pos_order_map.get(pid, []):
                 if sl == 0 and (ord.sl or 0) > 0: sl = float(ord.sl)
                 if tp == 0 and (ord.tp or 0) > 0: tp = float(ord.tp)
-
-        # Metode 4: parse dari comment field
         c_sl, c_tp = _parse_sltp_comment(p.get("close_comment", ""))
         if c_sl > 0: sl = c_sl
         if c_tp > 0: tp = c_tp
@@ -501,90 +467,60 @@ def _build_html_report(account_info, deals: list, sltp_cache: dict, order_map: d
         if sl == 0 and o_sl > 0: sl = o_sl
         if tp == 0 and o_tp > 0: tp = o_tp
 
-        bg = "#FFFFFF" if ri % 2 == 0 else "#F7F7F7"
-        position_rows_parts.append(
-            f'<tr bgcolor="{bg}" align="right">'
-            f'<td>{datetime.fromtimestamp(o.time).strftime("%Y.%m.%d %H:%M:%S")}</td>'
-            f'<td>{pid}</td><td>{p["symbol"]}</td><td>{p["type"]}</td>'
-            f'<td class="hidden" colspan="8"></td>'
-            f'<td>{o.volume:.2f}</td><td>{o.price:.5f}</td>'
-            f'<td>{sl:.5f}</td><td>{tp:.5f}</td>'
-            f'<td>{datetime.fromtimestamp(c.time).strftime("%Y.%m.%d %H:%M:%S")}</td>'
-            f'<td>{c.price:.5f}</td><td>{p["commission"]:.2f}</td>'
-            f'<td>{p["swap"]:.2f}</td><td colspan="2">{p["profit"]:.2f}</td>'
-            f'</tr>'
+        positions_out.append({
+            "time":       datetime.fromtimestamp(o.time).strftime("%Y.%m.%d %H:%M:%S"),
+            "position":   int(pid),
+            "symbol":     p["symbol"],
+            "type":       p["type"],
+            "volume":     round(float(o.volume), 2),
+            "price":      round(float(o.price), 5),
+            "sl":         sl if sl > 0 else None,
+            "tp":         tp if tp > 0 else None,
+            "time2":      datetime.fromtimestamp(c.time).strftime("%Y.%m.%d %H:%M:%S"),
+            "price2":     round(float(c.price), 5),
+            "commission": round(p["commission"], 2),
+            "swap":       round(p["swap"], 2),
+            "profit":     round(p["profit"], 2),
+        })
+
+    total_trades = len(positions_out)
+    winrate      = round((won / total_trades * 100), 2) if total_trades > 0 else 0.0
+    deposit_num  = total_deposit if total_deposit > 0 else max(balance - total_profit, 0)
+    gain_pct     = round((total_profit / deposit_num * 100), 2) if deposit_num > 0 else 0.0
+
+    # ── Daily aggregations ───────────────────────────────────
+    daily_profit_map: dict = {}
+    for p_data in positions_out:
+        date = p_data["time2"][:10].replace(".", "-")
+        daily_profit_map[date] = round(
+            daily_profit_map.get(date, 0.0) + p_data["profit"] + p_data["commission"] + p_data["swap"], 2
         )
-    position_rows = "".join(position_rows_parts)
+    daily_balance_map: dict = {}
+    for d_data in deals_out:
+        date = d_data["time"][:10].replace(".", "-")
+        daily_balance_map[date] = d_data["balance"]
 
-    # ── Orders ───────────────────────────────────────────────
-    type_map  = {0:"buy",1:"sell",2:"buy limit",3:"sell limit",4:"buy stop",
-                 5:"sell stop",6:"buy stop limit",7:"sell stop limit"}
-    state_map = {1:"filled",2:"canceled",3:"partial"}
-    order_rows_parts = []
-    for i, ord_obj in enumerate(sorted(order_map.values(), key=lambda x: x.time_setup)):
-        try:
-            bg     = "#FFFFFF" if i % 2 == 0 else "#F7F7F7"
-            o_time = datetime.fromtimestamp(ord_obj.time_setup).strftime("%Y.%m.%d %H:%M:%S")
-            c_time = (datetime.fromtimestamp(ord_obj.time_done).strftime("%Y.%m.%d %H:%M:%S")
-                      if ord_obj.time_done else "")
-            price  = f"{ord_obj.price_open:.5f}" if ord_obj.price_open > 0 else "market"
-            vol    = f"{ord_obj.volume_initial:.2f}/{ord_obj.volume_current:.2f}"
-            sl_s   = f"{ord_obj.sl:.3f}" if ord_obj.sl and ord_obj.sl > 0 else ""
-            tp_s   = f"{ord_obj.tp:.3f}" if ord_obj.tp and ord_obj.tp > 0 else ""
-            order_rows_parts.append(
-                f'<tr bgcolor="{bg}" align="right">'
-                f'<td>{o_time}</td><td>{ord_obj.ticket}</td><td>{ord_obj.symbol}</td>'
-                f'<td>{type_map.get(ord_obj.type, str(ord_obj.type))}</td>'
-                f'<td>{vol}</td><td>{price}</td><td>{sl_s}</td><td>{tp_s}</td>'
-                f'<td>{c_time}</td><td colspan="2">{state_map.get(ord_obj.state,"filled")}</td>'
-                f'<td colspan="3">{ord_obj.comment or ""}</td>'
-                f'</tr>\n'
-            )
-        except Exception:
-            pass
-    order_rows = "".join(order_rows_parts)
-
-    pct = lambda n: f"{(n / total_trades * 100) if total_trades else 0:.2f}%"
-    return f"""<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-<html><head><title>{login}: {name}</title>
-<style>td{{font:8pt Tahoma,Arial;}} th{{font:10pt Tahoma,Arial;}} .hidden{{display:none;}}</style>
-</head><body><div align="center">
-<table cellspacing="1" cellpadding="3" border="0">
-<tr align="center"><td colspan="15"><div style="font:14pt Tahoma"><b>Trade History Report</b></div></td></tr>
-<tr><th colspan="4" align="right">Name:</th><th colspan="11"><b>{name}</b></th></tr>
-<tr><th colspan="4" align="right">Account:</th><th colspan="11"><b>{login}</b></th></tr>
-<tr><th colspan="4" align="right">Company:</th><th colspan="11"><b>{company}</b></th></tr>
-<tr><th colspan="4" align="right">Date:</th><th colspan="11"><b>{datetime.now().strftime("%Y.%m.%d %H:%M")}</b></th></tr>
-<tr><th colspan="4" align="right">Currency:</th><th colspan="11"><b>{currency}</b></th></tr>
-<tr align="center"><th colspan="15" style="height:25px"><div style="font:10pt Tahoma"><b>Positions</b></div></th></tr>
-<tr align="center" bgcolor="#E5F0FC">
-<td><b>Time</b></td><td><b>Position</b></td><td><b>Symbol</b></td><td><b>Type</b></td>
-<td><b>Volume</b></td><td><b>Price</b></td><td><b>S / L</b></td><td><b>T / P</b></td>
-<td><b>Time</b></td><td><b>Price</b></td><td><b>Commission</b></td><td><b>Swap</b></td>
-<td colspan="3"><b>Profit</b></td>
-</tr>{position_rows}
-<tr align="center"><th colspan="14" style="height:25px"><div style="font:10pt Tahoma"><b>Orders</b></div></th></tr>
-<tr align="center" bgcolor="#E5F0FC">
-<td><b>Open Time</b></td><td><b>Order</b></td><td><b>Symbol</b></td><td><b>Type</b></td>
-<td><b>Volume</b></td><td><b>Price</b></td><td><b>S / L</b></td><td><b>T / P</b></td>
-<td><b>Time</b></td><td colspan="2"><b>State</b></td><td colspan="3"><b>Comment</b></td>
-</tr>{order_rows}
-<tr align="center"><th colspan="15" style="height:25px"><div style="font:10pt Tahoma"><b>Deals</b></div></th></tr>
-<tr align="center" bgcolor="#E5F0FC">
-<td><b>Time</b></td><td><b>Deal</b></td><td><b>Symbol</b></td><td><b>Type</b></td>
-<td><b>Direction</b></td><td><b>Volume</b></td><td><b>Price</b></td><td><b>Order</b></td>
-<td></td><td><b>Commission</b></td><td><b>Fee</b></td><td><b>Swap</b></td>
-<td><b>Profit</b></td><td><b>Balance</b></td><td colspan="2"><b>Comment</b></td>
-</tr>{deal_rows}
-<tr><td colspan="11"><b>Total Net Profit:</b></td><td colspan="4" align="right"><b>{total_profit:.2f}</b></td></tr>
-<tr><td colspan="11"><b>Deposit:</b></td><td colspan="4" align="right"><b>{total_deposit:.2f}</b></td></tr>
-<tr><td colspan="11"><b>Balance:</b></td><td colspan="4" align="right"><b>{balance:.2f}</b></td></tr>
-<tr><td colspan="11"><b>Equity:</b></td><td colspan="4" align="right"><b>{equity:.2f}</b></td></tr>
-<tr><td colspan="11">Profit Trades (% of total):</td>
-    <td colspan="4" align="right">{won} ({pct(won)})</td></tr>
-<tr><td colspan="11">Loss Trades (% of total):</td>
-    <td colspan="4" align="right">{lost} ({pct(lost)})</td></tr>
-</table></div></body></html>"""
+    return {
+        "meta": {
+            "account_name":    name,
+            "company":         company,
+            "currency":        currency,
+            "balance":         balance,
+            "equity":          equity,
+            "total_profit":    round(total_profit, 2),
+            "total_deposit":   round(total_deposit, 2),
+            "gain_pct":        gain_pct,
+            "max_drawdown_pct": round(max_dd, 2),
+            "winrate_pct":     winrate,
+            "total_trades":    total_trades,
+            "won_total":       won,
+            "lose_total":      lost,
+        },
+        "positions":    positions_out,
+        "deals":        deals_out,
+        "daily_profit": [{"date": d, "total_profit": v} for d, v in daily_profit_map.items()],
+        "daily_balance": [{"date": d, "balance": v} for d, v in daily_balance_map.items()],
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -689,12 +625,8 @@ def _run_journal_for(acc: dict) -> tuple:
                     except Exception as e:
                         log.warning(f"history_orders_get failed: {e}")
 
-                    # Build HTML (di luar MT5 call — pos_order_map sudah berisi semua data)
-                    html = _build_html_report(info, deals, sltp, order_map, pos_order_map)
-                    tmp_dir  = tempfile.mkdtemp(prefix="journal_")
-                    filepath = os.path.join(tmp_dir, f"report_{login}_{int(time.time())}.html")
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        f.write(html)
+                    # Build report data JSON (tanpa HTML, langsung dari MT5 objects)
+                    report_data = _build_report_data(info, deals, sltp, order_map, pos_order_map)
                     log.info(f"[Journal] Export OK: {login} ({len(deals)} deals, {open_count} open)")
 
             except Exception as e:
@@ -714,7 +646,7 @@ def _run_journal_for(acc: dict) -> tuple:
 
     # ── Upload (di luar lock — pure HTTP) ────────────────────
     try:
-        result = _api.upload_report(acc_id, filepath)
+        result = _api.upload_report(acc_id, report_data)
         if result.get("success"):
             log.info(f"[Journal] Upload OK: {login}")
             if new_sltp:
@@ -728,12 +660,6 @@ def _run_journal_for(acc: dict) -> tuple:
         log.error(f"[Journal] Upload failed {login}: {e}")
         _api.report_auth_error(acc_id, login, server, "upload_failed", 0, str(e)[:900])
         return False, open_count
-    finally:
-        try:
-            os.remove(filepath)
-            os.rmdir(os.path.dirname(filepath))
-        except Exception:
-            pass
 
 
 # ══════════════════════════════════════════════════════════════
